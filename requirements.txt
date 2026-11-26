@@ -1,0 +1,2 @@
+# Runtime uses Python standard library only (including tkinter).
+# Build tools are installed by scripts/build_windows.ps1.

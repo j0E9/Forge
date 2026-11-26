@@ -1,14 +1,14 @@
 .venv/
-venv/
+.build-venv/
 __pycache__/
-*.pyc
-node_modules/
-.env
-*.localqwen.bak
-dist/
+*.py[cod]
 build/
+dist/
+installer/output/
+*.spec
 
 # added for secrets safety
+.env
 .env.*
 *.env
 config.json
@@ -27,18 +27,15 @@ service-account*.json
 .netrc
 *.token
 *.pem.txt
-.build-venv/
-*.py[cod]
-installer/output/
-*.spec
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# added for secrets safety
+venv/
+node_modules/
+*.localqwen.bak
 *.exe
 *.msi
 _internal/
 base_library.zip
 unins000.*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
