@@ -35,3 +35,10 @@ installer/output/
 .idea/
 .DS_Store
 Thumbs.db
+
+# added for secrets safety
+*.exe
+*.msi
+_internal/
+base_library.zip
+unins000.*
