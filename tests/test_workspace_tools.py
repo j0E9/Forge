@@ -120,6 +120,25 @@ class WorkspaceToolTests(unittest.TestCase):
         out = self.tools.locate("anything", "drives", 3)
         self.assertIn("denied", out.lower())
 
+    def test_locate_rejects_common_word_false_positive(self):
+        # A README mentioning "project" must NOT be returned for "Project Genesis"
+        # (the real bug: it reported the workspace as the project).
+        (self.root / "README.md").write_text("This project does things.\n", encoding="utf-8")
+        out = self.tools.locate("Project Genesis", "workspace", 5)
+        self.assertIn("nothing matched", out.lower())
+        self.assertIn("scope='drives'", out)  # nudges to search the whole PC
+
+    def test_locate_finds_distinctive_word(self):
+        (self.root / "notes.md").write_text("The Genesis milestone shipped.\n", encoding="utf-8")
+        out = self.tools.locate("Project Genesis", "workspace", 5)
+        self.assertIn("notes.md", out)
+
+    def test_locate_accepts_path_alias_for_scope(self):
+        # The model often passes path='.' meaning the workspace; it must still work.
+        (self.root / "parser.py").write_text("def parse_invoice():\n    return 1\n", encoding="utf-8")
+        out = self.tools.locate("parse_invoice", path=".")
+        self.assertIn("parser.py", out)
+
     def test_tree_and_outline(self):
         (self.root / "pkg").mkdir()
         (self.root / "pkg" / "m.py").write_text("class A:\n    def go(self):\n        pass\n", encoding="utf-8")
@@ -443,6 +462,119 @@ class GitHubPushTests(unittest.TestCase):
         out = t.github_open_pr(title="x", base="main")
         self.assertIn("base branch", out.lower())
 
+    def test_github_use_repo_links_existing(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._is_repo = lambda: True
+
+        def fake_github(method, path, body=None):
+            if path == "/user":
+                return 200, {"login": "me"}
+            if path == "/repos/me/Forge":
+                return 200, {"full_name": "me/Forge", "clone_url": "https://github.com/me/Forge.git",
+                             "html_url": "https://github.com/me/Forge"}
+            return 404, {}
+        t._github = fake_github
+        git_calls = []
+
+        def fake_git(*a, **k):
+            git_calls.append(tuple(a))
+            if a[:2] == ("remote", "get-url"):
+                return 1, ""   # no origin yet -> add
+            return 0, ""
+        t._git = fake_git
+        out = t.github_use_repo(name="Forge")
+        self.assertIn("Linked origin", out)
+        self.assertIn(("remote", "add", "origin", "https://github.com/me/Forge.git"), git_calls)
+
+    def test_github_use_repo_refuses_missing_and_wont_create(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._is_repo = lambda: True
+        t._github = lambda m, p, b=None: ((200, {"login": "me"}) if p == "/user" else (404, {}))
+        out = t.github_use_repo(name="Nope")
+        self.assertIn("no repository", out.lower())
+        self.assertIn("do not create", out.lower())
+
+    def test_use_repo_schema_registered(self):
+        from tools import connectors
+        names = {s["function"]["name"] for s in connectors.SCHEMAS}
+        self.assertIn("github_use_repo", names)
+
+    def test_open_pr_blocks_when_no_new_commits(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._is_repo = lambda: True
+        t._remote_slug = lambda remote="origin": ("me", "repo")
+        t._current_branch = lambda: "forge/x"
+        t._git = lambda *a, **k: (0, "0") if a[:2] == ("rev-list", "--count") else (0, "")
+        out = t.github_open_pr(title="x", base="main")
+        self.assertIn("no new commits", out.lower())
+
+    def test_pr_schema_has_project_param(self):
+        from tools import connectors
+        d = {s["function"]["name"]: s for s in connectors.SCHEMAS}
+        self.assertIn("project", d["github_open_pr"]["function"]["parameters"]["properties"])
+        self.assertIn("project", d["git_commit"]["function"]["parameters"]["properties"])
+
+    def test_project_reroot_rejects_nonexistent_path(self):
+        from pathlib import Path
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t.root = Path(".").resolve()
+        t.approval = lambda *a, **k: True
+        t.log = lambda *_: None
+        out = t.call("github_open_pr", {"title": "x", "project": "Z:\\no\\such\\folder-xyz-123"})
+        self.assertIn("not a folder", out.lower())
+
+    def test_only_gitignore_changed_logic(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._git = lambda *a, **k: (0, ".gitignore\n")
+        self.assertTrue(t._only_gitignore_changed("main", "b"))
+        t._git = lambda *a, **k: (0, ".gitignore\nsrc/app.py\n")
+        self.assertFalse(t._only_gitignore_changed("main", "b"))
+        t._git = lambda *a, **k: (0, "\n")
+        self.assertIsNone(t._only_gitignore_changed("main", "b"))
+        t._git = lambda *a, **k: (1, "fatal")
+        self.assertIsNone(t._only_gitignore_changed("main", "b"))
+
+    def test_open_pr_blocks_gitignore_only_branch(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._is_repo = lambda: True
+        t._remote_slug = lambda remote="origin": ("me", "repo")
+        t._current_branch = lambda: "forge/x"
+        t._git = lambda *a, **k: (0, ".gitignore\n")
+        out = t.github_open_pr(title="x", base="main")
+        self.assertIn("ERROR", out)
+        self.assertIn(".gitignore", out)
+
+    def test_pr_state_maps_github_status(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._remote_slug = lambda remote="origin": ("me", "repo")
+        t._pr_checks = lambda owner, repo, sha: t._checks_stub
+        cases = [
+            ({"number": 1, "state": "open", "merged_at": "2026-01-01"}, "", "merged"),
+            ({"number": 2, "state": "closed"}, "", "closed"),
+            ({"number": 3, "state": "open", "draft": True}, "", "draft"),
+            ({"number": 4, "state": "open", "mergeable_state": "dirty"}, "", "conflicts"),
+            ({"number": 5, "state": "open", "mergeable_state": "clean"}, "1 failing", "changes"),
+            ({"number": 6, "state": "open", "mergeable_state": "blocked"}, "", "changes"),
+            ({"number": 7, "state": "open", "mergeable_state": "clean"}, "2 passed", "open"),
+        ]
+        for pr, checks, expected in cases:
+            t._checks_stub = checks
+            t._github = lambda method, path, body=None, _pr=pr: (200, dict(_pr, html_url="u", title="t"))
+            self.assertEqual(t.pr_state(pr["number"]).get("status"), expected, pr)
+
+    def test_pr_state_empty_without_remote(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._remote_slug = lambda remote="origin": None
+        self.assertEqual(t.pr_state(1), {})
+
     def test_pr_tool_schemas_registered(self):
         from tools import connectors
         names = {s["function"]["name"] for s in connectors.SCHEMAS}
@@ -474,6 +606,61 @@ class SecurityToolTests(unittest.TestCase):
 
     def test_identify_hash(self):
         self.assertIn("SHA-256", self.armed.call("identify_hash", {"value": "a" * 64}))
+
+
+class ExtraToolTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        from tools.extras import ExtraTools
+        self.x = ExtraTools(self.root, lambda *a, **k: True, lambda *_: None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_encoding_round_trips(self):
+        self.assertEqual(self.x.call("base64_decode",
+                         {"text": self.x.call("base64_encode", {"text": "forge"})}), "forge")
+        self.assertEqual(self.x.call("hex_decode",
+                         {"text": self.x.call("hex_encode", {"text": "forge"})}), "forge")
+        self.assertEqual(self.x.call("url_decode",
+                         {"text": self.x.call("url_encode", {"text": "a b&c"})}), "a b&c")
+
+    def test_read_tools(self):
+        (self.root / "f.txt").write_text("a\nb\nc\n", encoding="utf-8")
+        self.assertIn("3 lines", self.x.call("line_count", {"path": "f.txt"}))
+        self.assertEqual(self.x.call("head_file", {"path": "f.txt", "lines": 1}), "a")
+        self.assertIn("valid", self.x.call("json_validate", {"text": '{"a":1}'}).lower())
+
+    def test_write_tool_confined_to_workspace(self):
+        out = self.x.call("touch_file", {"path": "../escape.txt"})
+        self.assertIn("outside the workspace", out.lower())
+
+    def test_write_tool_respects_denial(self):
+        self.x.approval = lambda *a, **k: False
+        (self.root / "g.txt").write_text("b\na\n", encoding="utf-8")
+        self.assertIn("denied", self.x.call("sort_file", {"path": "g.txt"}).lower())
+        self.assertEqual((self.root / "g.txt").read_text(encoding="utf-8"), "b\na\n")
+
+    def test_recall_is_graceful_without_history(self):
+        out = self.x.call("recall", {"query": "anything"})
+        self.assertIsInstance(out, str)
+
+    def test_all_extras_routed_and_unique(self):
+        from tools.extras import SCHEMAS
+        names = [s["function"]["name"] for s in SCHEMAS]
+        self.assertGreaterEqual(len(names), 50)
+        self.assertEqual(len(names), len(set(names)))
+
+
+class SupervisorHealthTests(unittest.TestCase):
+    def test_registry_healthy_and_no_dead_ends(self):
+        from tools import ToolRegistry
+        reg = ToolRegistry(Path(__file__).resolve().parents[1],
+                           lambda *a, **k: True, lambda *_: None, lambda: True)
+        report = reg.supervisor.self_test(False)
+        self.assertIn("Registry integrity: PASS", report)
+        self.assertIn("OVERALL: HEALTHY", report)
 
 
 if __name__ == "__main__":

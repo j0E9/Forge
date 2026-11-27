@@ -44,12 +44,43 @@ class ConnectorTools:
         self.approval = approval
         self.log = log
 
+    # Git/GitHub tools may be pointed at a specific project folder (so "PR the
+    # changes in E:\path\to\Project" runs git THERE, not in the default workspace).
+    _REROOTABLE = {
+        "git_status", "git_diff", "git_init", "git_commit", "git_push", "git_pull",
+        "git_log", "git_branch", "git_remote", "github_open_pr", "github_pr_status",
+        "github_merge_pr", "github_create_repo", "github_use_repo",
+    }
+
     # ------------------------------------------------------------------ util
     def call(self, name: str, args: dict) -> str:
         try:
             fn = getattr(self, name, None)
             if fn is None or name.startswith("_") or name == "call":
                 return f"Unknown tool: {name}"
+            args = dict(args or {})
+            # Optional explicit project folder for git/GitHub actions. Once a project
+            # is given in a task it sticks, so a weak model needn't repeat it on every
+            # follow-up git call (branch -> commit -> open_pr).
+            proj = args.pop("project", None) or args.pop("repo_path", None)
+            target = self
+            if name in self._REROOTABLE:
+                p = None
+                if proj:
+                    p = Path(str(proj)).expanduser()
+                    if not p.is_absolute():
+                        p = self.root / p
+                    p = p.resolve()
+                    if not p.is_dir():
+                        return (f"ERROR: project path {proj!r} is not a folder on this PC. Pass the full "
+                                f"path to the project you want to act on (e.g. E:\\CodingProjects\\MyApp).")
+                    self._active_project = p
+                elif getattr(self, "_active_project", None):
+                    p = self._active_project
+                if p and p != self.root:
+                    target = ConnectorTools(p, self.approval, self.log)
+                    target._active_project = p
+            fn = getattr(target, name)
             return fn(**{k: v for k, v in args.items() if k in fn.__code__.co_varnames})
         except TypeError as exc:
             return f"ERROR: bad arguments for {name}: {exc}"
@@ -398,6 +429,37 @@ class ConnectorTools:
             msg += f"\nLinked the workspace: origin -> {url}. Next: git_commit, then git_push."
         return msg
 
+    def github_use_repo(self, name: str) -> str:
+        """Link this project's 'origin' remote to an EXISTING GitHub repo you already
+        own, by name (e.g. 'Forge' or 'owner/Forge'). Creates NOTHING. Use this when
+        the user names a target repo for a PR/push and the project has no remote."""
+        if not self._is_repo():
+            return "ERROR: not a git repository here. Call git_init first (same project)."
+        name = (name or "").strip().removesuffix(".git")
+        if not name:
+            return "ERROR: give the existing repository name, e.g. github_use_repo(name='Forge')."
+        if "/" in name:
+            owner, repo = name.split("/", 1)
+        else:
+            st, who = self._github("GET", "/user")
+            if st != 200:
+                return f"ERROR: could not identify your GitHub account: {self._gh_detail(who)}"
+            owner, repo = who.get("login", ""), name
+        st, data = self._github("GET", f"/repos/{owner}/{repo}")
+        if st == 404:
+            return (f"ERROR: no repository '{owner}/{repo}' on your account — check the exact name. Do NOT "
+                    f"create a new repo unless the user explicitly asked; if they did, use github_create_repo.")
+        if st != 200:
+            return f"GitHub error {st}: {self._gh_detail(data)}"
+        url = data.get("clone_url") or f"https://github.com/{owner}/{repo}.git"
+        code, _ = self._git("remote", "get-url", "origin")
+        action = "set-url" if code == 0 else "add"
+        code, out = self._git("remote", action, "origin", url)
+        if code != 0:
+            return f"ERROR: could not set origin to {owner}/{repo}: {out}"
+        return (f"✅ Linked origin to your existing repo {data.get('full_name', owner + '/' + repo)}: "
+                f"{data.get('html_url', url)}. Now commit on a branch and open the PR.")
+
     # ------------------------------------------------------- GitHub pull requests
     def _pr_checks(self, owner: str, repo: str, sha: str) -> str:
         """Compact CI status for a commit: e.g. '3 passed, 1 failing'."""
@@ -418,6 +480,40 @@ class ConnectorTools:
         parts += [f"{v} {k}" for k, v in tally.items() if k not in order]
         return ", ".join(parts)
 
+    def pr_state(self, number: int) -> dict:
+        """Machine-readable PR status for the sidebar dot.
+
+        Returns {'number','status','url','title','checks'} where status is one of
+        open / merged / closed / draft / conflicts / changes. Empty dict if it
+        cannot be determined (no remote, bad number, API error)."""
+        slug = self._remote_slug()
+        if not slug or not number:
+            return {}
+        owner, repo = slug
+        st, pr = self._github("GET", f"/repos/{owner}/{repo}/pulls/{int(number)}")
+        if st != 200 or not isinstance(pr, dict):
+            return {}
+        if pr.get("merged_at"):
+            status = "merged"
+        elif pr.get("state") == "closed":
+            status = "closed"
+        elif pr.get("draft"):
+            status = "draft"
+        else:
+            ms = (pr.get("mergeable_state") or "").lower()
+            checks = self._pr_checks(owner, repo, (pr.get("head") or {}).get("sha", ""))
+            if ms == "dirty":
+                status = "conflicts"
+            elif "failing" in checks:
+                status = "changes"
+            elif ms in ("blocked", "behind"):
+                status = "changes"
+            else:
+                status = "open"
+        return {"number": pr.get("number"), "status": status,
+                "url": pr.get("html_url", ""), "title": pr.get("title", ""),
+                "checks": self._pr_checks(owner, repo, (pr.get("head") or {}).get("sha", ""))}
+
     def _fmt_pr(self, owner: str, repo: str, pr: dict, detail: bool = False) -> str:
         state = "merged" if pr.get("merged_at") else pr.get("state", "?")
         head = (pr.get("head") or {}).get("ref", "?")
@@ -434,13 +530,29 @@ class ConnectorTools:
                 line += f"\n  checks: {checks}"
         return line
 
+    def _only_gitignore_changed(self, base: str, head: str):
+        """True if the only path differing between `base` and `head` is .gitignore,
+        False if there are real changes, None if it cannot be determined (so the
+        caller does not block a legitimate PR on a failed diff)."""
+        code, out = self._git("diff", "--name-only", f"{base}...{head}")
+        if code != 0:
+            return None
+        files = [f.strip() for f in out.splitlines() if f.strip()]
+        if not files:
+            return None  # truly empty — GitHub's "No commits between" handles it
+        meaningful = [f for f in files if f.lower() != ".gitignore"]
+        return not meaningful
+
     def github_open_pr(self, title: str, body: str = "", base: str = "main", head: str = "") -> str:
         """Open a pull request from the current (or given) branch into `base`."""
         if not self._is_repo():
             return "ERROR: not a git repository. Call git_init first."
         slug = self._remote_slug()
         if not slug:
-            return ("ERROR: no GitHub 'origin' remote. Use github_create_repo first, or push the repo once.")
+            return ("ERROR: this project has no GitHub 'origin' remote yet. If the user named an EXISTING "
+                    "repo to PR into (e.g. 'forge'), link it with github_use_repo(name='<repo>') — do NOT "
+                    "create a new repo. Only call github_create_repo if the user explicitly asked for a NEW "
+                    "repository. If unsure which repo they mean, ask.")
         owner, repo = slug
         head = (head or self._current_branch()).strip()
         if not head:
@@ -449,10 +561,30 @@ class ConnectorTools:
             return (f"ERROR: you are on the base branch '{base}'. A pull request needs a SEPARATE branch. "
                     f"Create one with git_branch(name='my-change'), commit your work there, then open the PR. "
                     f"(The deterministic '⬆ Open pull request' button in Connectors does all of this for you.)")
+        # Guard: the branch must actually carry new commits over base. A branch with
+        # no new commits (the model "committed" with nothing to commit) is the usual
+        # reason a PR is empty — catch it here with a clear message instead of a
+        # confusing push failure.
+        rc_c, cnt = self._git("rev-list", "--count", f"{base}..{head}")
+        if rc_c == 0 and cnt.strip() == "0":
+            return (f"ERROR: branch '{head}' has NO new commits over '{base}', so there is nothing to "
+                    f"open a pull request for. This means no changes were actually made. Edit the files "
+                    f"the user asked for with write_file/edit_file, commit them on this branch "
+                    f"(git_commit), THEN open the PR. (A 'Nothing to commit' result means you changed "
+                    f"nothing — go make the changes first.)")
+        # Guard against "empty" PRs whose only difference from base is .gitignore.
+        only = self._only_gitignore_changed(base, head)
+        if only is True:
+            return (f"ERROR: branch '{head}' only changes .gitignore — the actual project changes are "
+                    f"missing. You opened a PR without doing the work. Edit the files the user asked for "
+                    f"with write_file/edit_file, commit them on this branch, THEN open the PR. "
+                    f"(Installers/build outputs are git-ignored and never belong in a PR.)")
         # Make sure the branch exists on the remote.
         code, out = self._git("push", "-u", "origin", head, auth=True, timeout=300)
         if code != 0:
-            return f"ERROR: could not push branch '{head}': {out}"
+            hint = out or ("no output — the branch may have no new commits, or the remote rejected it. "
+                           "Make sure you committed real changes on this branch first.")
+            return f"ERROR: could not push branch '{head}': {hint}"
         status, data = self._github("POST", f"/repos/{owner}/{repo}/pulls",
                                     {"title": title, "body": body or "", "head": head, "base": base})
         if status in (200, 201):
@@ -695,6 +827,10 @@ def open_pull_request(root, title: str, base: str = "main", message: str = "", b
         out.append(f"• Created branch {branch}")
         commit = t.git_commit(message=message or title)
         out.append("• " + commit)
+        if t._only_gitignore_changed(base, branch) is True:
+            return "\n".join(out) + (
+                "\n❌ This branch only changes .gitignore — there are no real edits to put in a PR. "
+                "Make the actual changes to the project first, then open the PR.")
         code, o = t._git("push", "-u", "origin", branch, auth=True, timeout=300)
         if code != 0:
             return "\n".join(out) + f"\n❌ Push failed: {o}"
@@ -727,6 +863,18 @@ def pull_request_status(root, number: int = 0, log=None) -> str:
         return t.github_pr_status(number=int(number or 0))
     except Exception as exc:  # noqa: BLE001
         return f"❌ {type(exc).__name__}: {t._scrub(str(exc))[:200]}"
+
+
+def pull_request_state(root, number: int = 0, log=None) -> dict:
+    """Deterministic, model-free PR status for the sidebar dot. Returns {} on any
+    problem (no token, no remote, API error) so the caller can just skip the dot."""
+    try:
+        t = ConnectorTools(Path(root), lambda *a, **k: True, log or (lambda *_: None))
+        if not t._token() or not t._remote_slug():
+            return {}
+        return t.pr_state(int(number or 0))
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def merge_pull_request(root, number: int, method: str = "squash", log=None) -> str:
@@ -795,10 +943,15 @@ _DEFS = {
                    {"action": {"type": "string", "enum": ["list", "add", "set-url"]}, "name": {"type": "string"},
                     "url": {"type": "string"}}, []),
     "github_list_repos": ("List the user's GitHub repositories.", {"count": {"type": "integer"}}, []),
-    "github_create_repo": ("Create a GitHub repository (private by default) and link the workspace to it as "
-                           "'origin'. Then use git_commit and git_push.",
+    "github_create_repo": ("Create a BRAND-NEW GitHub repository and link it as 'origin'. Only use when the "
+                           "user explicitly asks for a NEW repo. To send changes to an EXISTING repo, use "
+                           "github_use_repo instead.",
                            {"name": {"type": "string"}, "private": {"type": "boolean"},
                             "description": {"type": "string"}, "link_workspace": {"type": "boolean"}}, ["name"]),
+    "github_use_repo": ("Link this project's 'origin' to an EXISTING GitHub repo you own, by name (e.g. "
+                        "'Forge' or 'owner/Forge'). Creates nothing. Use this when the user names a target "
+                        "repo for a PR/push and the project has no remote yet.",
+                        {"name": {"type": "string"}}, ["name"]),
     "github_open_pr": ("Open a GitHub pull request from the CURRENT branch into `base` (default 'main'). "
                        "The current branch must differ from base and have commits base lacks. To PR your "
                        "work, FIRST create a branch (git_branch name=...), commit on it, THEN call this.",
@@ -820,6 +973,17 @@ _DEFS = {
                     "folder": {"type": "string"}, "search": {"type": "string"}}, []),
 }
 
-SCHEMAS = [{"type": "function", "function": {"name": n, "description": d,
-                                             "parameters": {"type": "object", "properties": p, "required": r}}}
-           for n, (d, p, r) in _DEFS.items()]
+_PROJECT_PROP = {"type": "string",
+                 "description": "Optional full path to the project folder to run git in "
+                                "(e.g. E:\\\\CodingProjects\\\\MyApp). Pass this whenever the user names a "
+                                "specific project or path to act on, so git runs in THAT repository "
+                                "instead of the default workspace."}
+
+SCHEMAS = []
+for _n, (_d, _p, _r) in _DEFS.items():
+    _props = dict(_p)
+    if _n in ConnectorTools._REROOTABLE:
+        _props["project"] = _PROJECT_PROP
+    SCHEMAS.append({"type": "function",
+                    "function": {"name": _n, "description": _d,
+                                 "parameters": {"type": "object", "properties": _props, "required": _r}}})
