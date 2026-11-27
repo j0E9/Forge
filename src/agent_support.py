@@ -42,8 +42,8 @@ TOOL_GROUPS = [
     (r"\b(git|github|commit|diff|branch|repo\w*|push|pull|clone|version control|backup|back up|"
      r"pull request|\bpr\b|merge)\b",
      ("git_status", "git_diff", "git_init", "git_commit", "git_push", "git_pull", "git_clone", "git_log",
-      "git_branch", "git_remote", "github_list_repos", "github_create_repo", "github_open_pr",
-      "github_pr_status", "github_merge_pr")),
+      "git_branch", "git_remote", "github_list_repos", "github_create_repo", "github_use_repo",
+      "github_open_pr", "github_pr_status", "github_merge_pr")),
     (r"\b(e-?mail|mail|inbox|gmail|outlook|smtp|imap)\b", ("send_email", "read_email")),
     (r"\b(adb|android|phone|apk|gradle|ssh|scp|remote|raspberry|server at)\b",
      ("tcp_check", "adb_devices", "adb_connect", "adb_pair", "adb_shell", "adb_install",
@@ -56,6 +56,34 @@ TOOL_GROUPS = [
     (r"\b(pdf|docx?|word|excel|xlsx|pptx?|powerpoint|document|spreadsheet)\b", ("read_document",)),
     (r"\b(parallel|sub-?agents?|capacity|many files)\b", ("device_capacity", "run_parallel_agents")),
     (r"\b(self.?test|supervisor|health|everything work\w*|is it working)\b", ("self_test",)),
+    # Finding things by name/description, including beyond the workspace.
+    (r"\b(locate|find|where(?:'s| is| are)?|which (?:file|folder|project)|project called|"
+     r"folder called|outside the workspace|another (?:folder|drive|project)|on (?:my|the) "
+     r"(?:pc|computer|drive)|elsewhere|nearby|exists?)\b",
+     ("locate", "tree", "file_outline", "grep_regex", "read_lines", "recent_files",
+      "find_folder", "path_info")),
+    # Cross-session memory: recall things from other chats.
+    (r"\b(recall|remember|earlier|previous\w*|before|last time|other (?:chat|session|conversation)|"
+     r"we (?:discussed|talked)|you (?:said|told|mentioned)|past (?:chat|conversation)|yesterday)\b",
+     ("recall",)),
+    # Text / file inspection.
+    (r"\b(line ?count|count (?:the )?lines|word ?count|characters?|\bhead\b|\btail\b|todo|fixme|"
+     r"lines of code|\bloc\b|duplicate|largest|empty files?|\bdiff\b|digest|hash of|file stats|"
+     r"project stats|\burls?\b|emails?|how many (?:files|lines))\b",
+     ("head_file", "tail_file", "line_count", "word_count", "char_count", "count_matches",
+      "find_in_file", "file_digest", "diff_files", "count_todos", "count_loc", "count_files",
+      "largest_files", "find_by_ext", "find_empty", "find_duplicates", "dir_size",
+      "project_stats", "path_info", "extract_urls", "extract_emails")),
+    # Data / encoding / dev utilities.
+    (r"\b(json|csv|encode|decode|base64|\bhex\b|url ?encode|url ?decode|uuid|slug|token|rot13|"
+     r"timestamp|minif\w*|pretty.?print|wrap text|syntax check|validate)\b",
+     ("json_pretty", "json_validate", "json_get", "json_minify", "csv_preview", "csv_columns",
+      "csv_rowcount", "csv_to_json", "base64_encode", "base64_decode", "url_encode", "url_decode",
+      "hex_encode", "hex_decode", "rot13", "uuid_new", "random_token", "slugify", "reverse_text",
+      "timestamp", "wrap_text", "py_syntax_check")),
+    (r"\b(sort|dedup\w*|trim|touch|append (?:a )?line|write json|set (?:the )?(?:key|json))\b",
+     ("sort_file", "dedupe_file", "trim_whitespace", "touch_file", "append_line", "write_json",
+      "set_json_key")),
 ]
 
 
@@ -77,11 +105,20 @@ def build_system_prompt(workspace, extra_tools_hint: str = "", name: str = "Forg
 You are NOT a text-only chatbot. Never say you cannot access the machine, files, images or commands -
 call a tool instead. Workspace root: {workspace} (use paths relative to it).
 
+Autonomy: the user states a GOAL; YOU choose and run whatever tools are needed. Never ask permission
+to use a tool and never ask which tool to use - just call it. Chain as many tool calls as the task needs.
+
 Finding things: when the user refers to a file, folder or project WITHOUT giving its exact name or
-path (e.g. "work on the login page", "fix the parser", "the invoice script"), call locate(query=...)
-FIRST - it finds the right file by matching names AND file contents and ranks the hits. Only ask the
-user where something is if locate finds nothing. Use tree() to grasp a project's layout and
-file_outline() to see a file's functions/classes without reading the whole file.
+path (e.g. "work on the login page", "the project called Genesis"), call locate(query=...) FIRST - it
+matches names AND contents and also checks folders next to the workspace. If locate finds nothing, or
+the user says it's elsewhere / outside the workspace / on the PC, call locate AGAIN with scope='drives'
+(whole computer) or scope='home' - do NOT reuse path='.' and do NOT claim it's in the workspace when it
+is not. Only ask the user where something is after a drives-scope search also fails. Use tree() for
+layout and file_outline() for a file's functions/classes.
+
+Memory across chats: if the user refers to something from an earlier or different chat ("like we
+discussed", "the thing from yesterday", "you said earlier"), call recall(query=...) to search your
+other sessions before answering - do not say you have no memory of it until recall returns nothing.
 
 GitHub: ALWAYS use the git_*/github_* tools - NEVER raw `git` through run_command (it loses the saved
 token and fails). To publish a project: git_init -> git_commit(message=...) ->
@@ -90,14 +127,28 @@ placeholder URL like <your-username>. If a tool says no token or access is denie
 set a GitHub token in Connectors - do not retry blindly or claim success. (The user can also click the
 "Push workspace to GitHub" button in Connectors, which does all of this without you.)
 
+Target project: git/GitHub actions run in the active workspace BY DEFAULT. If the user names a specific
+project or path (e.g. 'PR the changes in "E:\\CodingProjects\\MyApp"'), pass project="<that full path>"
+to the git_* / github_* tool so git runs in THAT repository - do NOT open the PR in the default
+workspace or some other repo. Each repo has its own GitHub remote; the PR lands in the remote of the
+project you point git at.
+Existing vs new repo - NEVER create a new GitHub repo on your own. If the user names a target repo
+(e.g. "to the repo forge", "my Forge repo") and the project has no 'origin' remote, link the EXISTING
+repo with github_use_repo(name="forge") - do NOT call github_create_repo and do NOT name a repo after
+the folder. Only call github_create_repo when the user EXPLICITLY asks to create a NEW repository. If no
+remote exists and the user did not name a repo, ask which repo to use rather than creating one.
 Pull requests: when the user asks to "PR", "open a pull request", "raise a PR" or "PR the changes"
-(instead of committing to main), do NOT commit to main. The reliable path is the deterministic
-"Open pull request" button in Connectors (it makes a branch, commits, pushes and opens the PR). If you
-do it yourself: git_branch(name="forge/<short-desc>") to create AND switch to a NEW branch, make/commit
-the changes there, then github_open_pr(title=..., base="main"). To report status use
-github_pr_status (list PRs, or pass number for one PR's state and CI checks). To merge use
-github_merge_pr(number=...). Never claim a PR was opened or merged unless github_open_pr/github_merge_pr
-actually returned success with a PR number - a plain git_commit is NOT a pull request.
+(instead of committing to main), do NOT commit to main. CRITICAL ORDER - make the real changes FIRST:
+(1) Actually edit the project with write_file/edit_file so the files the user asked about really change
+on disk - a PR is worthless without the actual work. (2) git_branch(name="forge/<short-desc>") to
+create AND switch to a NEW branch. (3) git_commit(message=...) on that branch. (4)
+github_open_pr(title=..., base="main"). NEVER open a PR that only changes .gitignore or has no real
+edits - that means you skipped step 1; go back and make the changes the user asked for. (Build outputs
+like .exe/.msi installers are generated by building, are git-ignored, and do NOT belong in a PR - a PR
+carries source changes, not installers.) To report status use github_pr_status (list PRs, or pass
+number for one PR's state and CI checks). To merge use github_merge_pr(number=...). Never claim a PR was
+opened or merged unless github_open_pr/github_merge_pr actually returned success with a PR number - a
+plain git_commit is NOT a pull request.
 
 How to work:
 1. Act with tool calls. Never print commands or code for the user to run - call write_file,
@@ -325,6 +376,13 @@ def looks_unexecuted(text: str, executed: set[str]) -> bool:
     if not (executed & {"github_merge_pr"}) and re.search(
             r"(?i)((?:merged|merging) (?:the |your )?(?:pull request|pr)\b|"
             r"\b(?:pull request|pr)\b[^.\n]{0,40}\bmerged\b)", text):
+        return True
+    # Claiming a branch was merged into main / that main was updated, when no merge
+    # tool ran - a weak model's made-up excuse after an empty/failed PR.
+    if not (executed & {"github_merge_pr", "git_push", "git_pull"}) and re.search(
+            r"(?i)(\bbranch\b[^.\n]{0,40}\b(?:already )?(?:been )?merged\b|"
+            r"merged (?:in)?to (?:the )?(?:main|master|base)\b|"
+            r"\bmain\b[^.\n]{0,30}\b(?:updated|up to date|already has)\b)", text):
         return True
     return bool(_ASK_USER.search(text)) and not did_work
 
