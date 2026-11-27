@@ -49,7 +49,7 @@ class ConnectorTools:
     _REROOTABLE = {
         "git_status", "git_diff", "git_init", "git_commit", "git_push", "git_pull",
         "git_log", "git_branch", "git_remote", "github_open_pr", "github_pr_status",
-        "github_merge_pr", "github_create_repo",
+        "github_merge_pr", "github_create_repo", "github_use_repo",
     }
 
     # ------------------------------------------------------------------ util
@@ -429,6 +429,37 @@ class ConnectorTools:
             msg += f"\nLinked the workspace: origin -> {url}. Next: git_commit, then git_push."
         return msg
 
+    def github_use_repo(self, name: str) -> str:
+        """Link this project's 'origin' remote to an EXISTING GitHub repo you already
+        own, by name (e.g. 'Forge' or 'owner/Forge'). Creates NOTHING. Use this when
+        the user names a target repo for a PR/push and the project has no remote."""
+        if not self._is_repo():
+            return "ERROR: not a git repository here. Call git_init first (same project)."
+        name = (name or "").strip().removesuffix(".git")
+        if not name:
+            return "ERROR: give the existing repository name, e.g. github_use_repo(name='Forge')."
+        if "/" in name:
+            owner, repo = name.split("/", 1)
+        else:
+            st, who = self._github("GET", "/user")
+            if st != 200:
+                return f"ERROR: could not identify your GitHub account: {self._gh_detail(who)}"
+            owner, repo = who.get("login", ""), name
+        st, data = self._github("GET", f"/repos/{owner}/{repo}")
+        if st == 404:
+            return (f"ERROR: no repository '{owner}/{repo}' on your account — check the exact name. Do NOT "
+                    f"create a new repo unless the user explicitly asked; if they did, use github_create_repo.")
+        if st != 200:
+            return f"GitHub error {st}: {self._gh_detail(data)}"
+        url = data.get("clone_url") or f"https://github.com/{owner}/{repo}.git"
+        code, _ = self._git("remote", "get-url", "origin")
+        action = "set-url" if code == 0 else "add"
+        code, out = self._git("remote", action, "origin", url)
+        if code != 0:
+            return f"ERROR: could not set origin to {owner}/{repo}: {out}"
+        return (f"✅ Linked origin to your existing repo {data.get('full_name', owner + '/' + repo)}: "
+                f"{data.get('html_url', url)}. Now commit on a branch and open the PR.")
+
     # ------------------------------------------------------- GitHub pull requests
     def _pr_checks(self, owner: str, repo: str, sha: str) -> str:
         """Compact CI status for a commit: e.g. '3 passed, 1 failing'."""
@@ -518,7 +549,10 @@ class ConnectorTools:
             return "ERROR: not a git repository. Call git_init first."
         slug = self._remote_slug()
         if not slug:
-            return ("ERROR: no GitHub 'origin' remote. Use github_create_repo first, or push the repo once.")
+            return ("ERROR: this project has no GitHub 'origin' remote yet. If the user named an EXISTING "
+                    "repo to PR into (e.g. 'forge'), link it with github_use_repo(name='<repo>') — do NOT "
+                    "create a new repo. Only call github_create_repo if the user explicitly asked for a NEW "
+                    "repository. If unsure which repo they mean, ask.")
         owner, repo = slug
         head = (head or self._current_branch()).strip()
         if not head:
@@ -909,10 +943,15 @@ _DEFS = {
                    {"action": {"type": "string", "enum": ["list", "add", "set-url"]}, "name": {"type": "string"},
                     "url": {"type": "string"}}, []),
     "github_list_repos": ("List the user's GitHub repositories.", {"count": {"type": "integer"}}, []),
-    "github_create_repo": ("Create a GitHub repository (private by default) and link the workspace to it as "
-                           "'origin'. Then use git_commit and git_push.",
+    "github_create_repo": ("Create a BRAND-NEW GitHub repository and link it as 'origin'. Only use when the "
+                           "user explicitly asks for a NEW repo. To send changes to an EXISTING repo, use "
+                           "github_use_repo instead.",
                            {"name": {"type": "string"}, "private": {"type": "boolean"},
                             "description": {"type": "string"}, "link_workspace": {"type": "boolean"}}, ["name"]),
+    "github_use_repo": ("Link this project's 'origin' to an EXISTING GitHub repo you own, by name (e.g. "
+                        "'Forge' or 'owner/Forge'). Creates nothing. Use this when the user names a target "
+                        "repo for a PR/push and the project has no remote yet.",
+                        {"name": {"type": "string"}}, ["name"]),
     "github_open_pr": ("Open a GitHub pull request from the CURRENT branch into `base` (default 'main'). "
                        "The current branch must differ from base and have commits base lacks. To PR your "
                        "work, FIRST create a branch (git_branch name=...), commit on it, THEN call this.",

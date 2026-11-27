@@ -462,6 +462,45 @@ class GitHubPushTests(unittest.TestCase):
         out = t.github_open_pr(title="x", base="main")
         self.assertIn("base branch", out.lower())
 
+    def test_github_use_repo_links_existing(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._is_repo = lambda: True
+
+        def fake_github(method, path, body=None):
+            if path == "/user":
+                return 200, {"login": "me"}
+            if path == "/repos/me/Forge":
+                return 200, {"full_name": "me/Forge", "clone_url": "https://github.com/me/Forge.git",
+                             "html_url": "https://github.com/me/Forge"}
+            return 404, {}
+        t._github = fake_github
+        git_calls = []
+
+        def fake_git(*a, **k):
+            git_calls.append(tuple(a))
+            if a[:2] == ("remote", "get-url"):
+                return 1, ""   # no origin yet -> add
+            return 0, ""
+        t._git = fake_git
+        out = t.github_use_repo(name="Forge")
+        self.assertIn("Linked origin", out)
+        self.assertIn(("remote", "add", "origin", "https://github.com/me/Forge.git"), git_calls)
+
+    def test_github_use_repo_refuses_missing_and_wont_create(self):
+        from tools import connectors
+        t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)
+        t._is_repo = lambda: True
+        t._github = lambda m, p, b=None: ((200, {"login": "me"}) if p == "/user" else (404, {}))
+        out = t.github_use_repo(name="Nope")
+        self.assertIn("no repository", out.lower())
+        self.assertIn("do not create", out.lower())
+
+    def test_use_repo_schema_registered(self):
+        from tools import connectors
+        names = {s["function"]["name"] for s in connectors.SCHEMAS}
+        self.assertIn("github_use_repo", names)
+
     def test_open_pr_blocks_when_no_new_commits(self):
         from tools import connectors
         t = connectors.ConnectorTools.__new__(connectors.ConnectorTools)

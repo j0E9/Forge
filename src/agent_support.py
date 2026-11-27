@@ -42,8 +42,8 @@ TOOL_GROUPS = [
     (r"\b(git|github|commit|diff|branch|repo\w*|push|pull|clone|version control|backup|back up|"
      r"pull request|\bpr\b|merge)\b",
      ("git_status", "git_diff", "git_init", "git_commit", "git_push", "git_pull", "git_clone", "git_log",
-      "git_branch", "git_remote", "github_list_repos", "github_create_repo", "github_open_pr",
-      "github_pr_status", "github_merge_pr")),
+      "git_branch", "git_remote", "github_list_repos", "github_create_repo", "github_use_repo",
+      "github_open_pr", "github_pr_status", "github_merge_pr")),
     (r"\b(e-?mail|mail|inbox|gmail|outlook|smtp|imap)\b", ("send_email", "read_email")),
     (r"\b(adb|android|phone|apk|gradle|ssh|scp|remote|raspberry|server at)\b",
      ("tcp_check", "adb_devices", "adb_connect", "adb_pair", "adb_shell", "adb_install",
@@ -132,6 +132,11 @@ project or path (e.g. 'PR the changes in "E:\\CodingProjects\\MyApp"'), pass pro
 to the git_* / github_* tool so git runs in THAT repository - do NOT open the PR in the default
 workspace or some other repo. Each repo has its own GitHub remote; the PR lands in the remote of the
 project you point git at.
+Existing vs new repo - NEVER create a new GitHub repo on your own. If the user names a target repo
+(e.g. "to the repo forge", "my Forge repo") and the project has no 'origin' remote, link the EXISTING
+repo with github_use_repo(name="forge") - do NOT call github_create_repo and do NOT name a repo after
+the folder. Only call github_create_repo when the user EXPLICITLY asks to create a NEW repository. If no
+remote exists and the user did not name a repo, ask which repo to use rather than creating one.
 Pull requests: when the user asks to "PR", "open a pull request", "raise a PR" or "PR the changes"
 (instead of committing to main), do NOT commit to main. CRITICAL ORDER - make the real changes FIRST:
 (1) Actually edit the project with write_file/edit_file so the files the user asked about really change
